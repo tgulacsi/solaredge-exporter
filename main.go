@@ -44,53 +44,86 @@ func Main() error {
 		return err
 	}
 
+	type flowMetrics struct {
+		GridCP, LoadCP, PVCP, StorageCP, StorageLevel *metrics.Gauge
+	}
+	type inverterMetric struct {
+		Voltage, Temperature, TotalActivePower, TotalEnergy *metrics.Gauge
+	}
+	type siteMetrics struct {
+		SiteID    int
+		Flow      flowMetrics
+		Inverters map[string]inverterMetric
+	}
 	grp, ctx := errgroup.WithContext(ctx)
 	grp.Go(func() error {
 		ticker := time.NewTicker(15 * time.Minute)
-		var labels []string
-		var mGridCP, mLoadCP, mPVCP, mStorageCP, mStorageLevel *metrics.Gauge
+		ms := make(map[int]siteMetrics, 1)
 		for {
-			labels = labels[:0]
 			for _, site := range sites {
-				nm := metricName{SiteID: site.ID}
+				s, ok := ms[site.ID]
+				if !ok {
+					G := func(f, m string) *metrics.Gauge {
+						return metrics.NewGauge(metricName{
+							Metric: m, Value: f,
+							Name: "flow", SiteID: site.ID,
+						}.String(), nil)
+					}
+					s = siteMetrics{
+						SiteID:    site.ID,
+						Inverters: make(map[string]inverterMetric, 1),
+						Flow: flowMetrics{
+							GridCP:       G("grid", "current_power"),
+							LoadCP:       G("load", "current_power"),
+							PVCP:         G("PV", "current_power"),
+							StorageCP:    G("storage", "current_power"),
+							StorageLevel: G("storage", "current_level"),
+						},
+					}
+					ms[site.ID] = s
+				}
 				if flow, err := site.GetPowerFlow(ctx); err != nil {
 					logger.Error("GetPowerFlow", "error", err)
 				} else {
-					if mGridCP == nil {
-						nm := nm
-						nm.Name = "current_power"
-						nm.Flow = "grid"
-						mGridCP = metrics.NewGauge(nm.String(), nil)
-						nm.Flow = "load"
-						mLoadCP = metrics.NewGauge(nm.String(), nil)
-						nm.Flow = "PV"
-						mPVCP = metrics.NewGauge(nm.String(), nil)
-						nm.Flow = "storage"
-						mStorageCP = metrics.NewGauge(nm.String(), nil)
-						nm.Name = "charge_level"
-						mStorageLevel = metrics.NewGauge(nm.String(), nil)
-					}
-					mGridCP.Set(flow.Grid.CurrentPower)
-					mLoadCP.Set(flow.Load.CurrentPower)
-					mPVCP.Set(flow.PV.CurrentPower)
-					mStorageCP.Set(flow.Storage.CurrentPower)
-					mStorageLevel.Set(flow.Storage.ChargeLevel)
+					s.Flow.GridCP.Set(flow.Grid.CurrentPower)
+					s.Flow.LoadCP.Set(flow.Load.CurrentPower)
+					s.Flow.PVCP.Set(flow.PV.CurrentPower)
+					s.Flow.StorageCP.Set(flow.Storage.CurrentPower)
+					s.Flow.StorageLevel.Set(flow.Storage.ChargeLevel)
 				}
 
 				metrics.WritePrometheus(os.Stdout, false)
 
-				inventory, err := site.GetInventory(ctx)
+				inverters, err := site.GetInverters(ctx)
 				if err != nil {
-					logger.Error("GetInventory", "error", err)
+					logger.Error("GetInverters", "error", err)
 				} else {
-					for _, inverter := range inventory.Inverters {
-						telemetry, err := inverter.GetTelemetry(ctx, time.Now().Add(-24*time.Hour), time.Now())
+					logger.Info("inverters", "inverters", inverters)
+					for _, inverter := range inverters {
+						inv, ok := s.Inverters[inverter.SerialNumber]
+						if !ok {
+							G := func(m string) *metrics.Gauge {
+								return metrics.NewGauge(metricName{
+									Metric: m, Name: "inverter",
+									Value: inverter.SerialNumber, SiteID: site.ID,
+								}.String(), nil)
+							}
+							inv.Temperature = G("temperature")
+							inv.TotalActivePower = G("total_active_power")
+							inv.TotalEnergy = G("total_energy")
+							inv.Voltage = G("voltage")
+							s.Inverters[inverter.SerialNumber] = inv
+						}
+						telemetry, err := inverter.GetTelemetry(ctx, time.Now().Add(-29*time.Minute), time.Now())
 						if err != nil {
 							logger.Error("GetTelemetry", "inverter", inverter.Name, "error", err)
 							continue
 						}
 						for _, entry := range telemetry {
-							fmt.Printf("%s - %s - %5.1f V - %4.1f ºC - %6.1f\n", inverter.Name, entry.Time, entry.DcVoltage, entry.Temperature, entry.TotalActivePower)
+							inv.Voltage.Set(entry.DcVoltage)
+							inv.Temperature.Set(entry.Temperature)
+							inv.TotalActivePower.Set(entry.TotalActivePower)
+							inv.TotalEnergy.Set(entry.TotalEnergy)
 						}
 					}
 				}
@@ -111,17 +144,13 @@ func Main() error {
 }
 
 type metricName struct {
-	Name   string
-	Flow   string
-	SiteID int
+	Metric      string
+	Name, Value string
+	SiteID      int
 }
 
 func (mn metricName) String() string {
 	var buf strings.Builder
-	fmt.Fprintf(&buf, `%s{siteID="%d"`, mn.Name, mn.SiteID)
-	if mn.Flow != "" {
-		fmt.Fprintf(&buf, `,flow=%q`, mn.Flow)
-	}
-	buf.WriteByte('}')
+	fmt.Fprintf(&buf, `%s{siteID="%d",%s=%q}`, mn.Metric, mn.SiteID, mn.Name, mn.Value)
 	return buf.String()
 }
